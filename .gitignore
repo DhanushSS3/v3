@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+*.env.local
+.prisma/
+prisma/migrations/**/migration_lock.toml
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.uv/
+.mypy_cache/
+.pytest_cache/
+*.log
+.DS_Store
+Thumbs.db

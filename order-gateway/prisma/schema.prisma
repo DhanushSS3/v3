@@ -1,0 +1,343 @@
+// Prisma schema for order-gateway → order_db
+// Database: PostgreSQL 16 (port 5434 in dev)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("ORDER_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OrderType {
+  BUY
+  SELL
+  BUY_LIMIT
+  SELL_LIMIT
+  BUY_STOP
+  SELL_STOP
+}
+
+enum OrderStatus {
+  RECEIVED
+  RISK_CHECK
+  QUEUED
+  PROVIDER_SENT
+  OPEN
+  MODIFY
+  CLOSING
+  CLOSED
+  CANCELLED
+  REJECTED
+}
+
+enum CloseReason {
+  user
+  stoploss
+  takeprofit
+  admin
+  liquidation
+}
+
+enum ExecutionMode {
+  external_lp
+  local_book
+  internal
+}
+
+enum OrderChannel {
+  web
+  mobile_ios
+  mobile_android
+  api
+  algo
+}
+
+enum SubIdType {
+  order_id
+  close_id
+  cancel_id
+  modify_id
+  stoploss_id
+  takeprofit_id
+  stoploss_cancel_id
+  takeprofit_cancel_id
+}
+
+enum SubIdStatus {
+  active
+  executed
+  cancelled
+  replaced
+  expired
+}
+
+enum MamOrderStatus {
+  PENDING
+  ALLOCATING
+  OPEN
+  CLOSING
+  CLOSED
+  CANCELLED
+  FAILED
+}
+
+enum AllocationMethod {
+  balance
+  free_margin
+  equity
+  lot
+}
+
+enum RoundingStrategy {
+  symbol_step
+  floor
+  ceil
+}
+
+enum CopyReplicationStatus {
+  REPLICATING
+  OPEN
+  CLOSED
+  FAILED
+  SKIPPED
+}
+
+enum RejectionStage {
+  gateway
+  risk
+  execution
+  provider
+}
+
+enum LpRoutingType {
+  fix
+  api
+  local
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LP Provider Registry — replaces sending_orders:'rock' magic string
+// ─────────────────────────────────────────────────────────────────────────────
+
+model LpProvider {
+  id          String        @id @default(uuid()) @db.Uuid
+  /// Logical name used in routing — e.g. 'barclays', 'rock', 'local'
+  name        String        @unique
+  displayName String
+  routingType LpRoutingType
+  isActive    Boolean       @default(true)
+  /// Connection config (host, port, credentials) — stored encrypted
+  config      Json          @default("{}")
+  createdAt   DateTime      @default(now()) @db.Timestamptz()
+
+  @@map("lp_providers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders — canonical operational record (partitioned by month in prod)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Order {
+  id              String        @id @default(uuid()) @db.Uuid
+  /// Human-readable: ORD-2025-xxxxx or UUID hex
+  orderId         String        @unique
+  userId          String        @db.Uuid
+  /// 'live' | 'demo'
+  userType        String
+  /// 'standard' | 'mam_investor' | 'copy_follower' | 'algo'
+  accountType     String        @default("standard")
+  symbol          String
+  orderType       OrderType
+  volume          Decimal       @db.Decimal(12, 4)
+  contractSize    Decimal       @default(100000) @db.Decimal(18, 4)
+  openPrice       Decimal?      @db.Decimal(18, 8)
+  closePrice      Decimal?      @db.Decimal(18, 8)
+  stopLoss        Decimal?      @db.Decimal(18, 8)
+  takeProfit      Decimal?      @db.Decimal(18, 8)
+  /// Entry price for limit/stop orders
+  limitPrice      Decimal?      @db.Decimal(18, 8)
+  status          OrderStatus   @default(RECEIVED)
+  closeReason     CloseReason?
+  openCommission  Decimal       @default(0) @db.Decimal(18, 6)
+  closeCommission Decimal       @default(0) @db.Decimal(18, 6)
+  swap            Decimal       @default(0) @db.Decimal(18, 6)
+  grossPnl        Decimal?      @db.Decimal(18, 6)
+  netPnl          Decimal?      @db.Decimal(18, 6)
+  marginUsed      Decimal?      @db.Decimal(18, 6)
+  // Execution source — who executed this order
+  lpProviderId    String?       @db.Uuid
+  executionMode   ExecutionMode @default(external_lp)
+  // Trading mode cross-references
+  mamOrderId      String?       @db.Uuid
+  copySourceId    String?       @db.Uuid
+  algoStrategyId  String?       @db.Uuid
+  groupName       String?
+  // Device tracking — populated by Order Gateway from session context
+  deviceId        String?
+  fingerprintHash String?
+  clientIp        String?
+  channel         OrderChannel  @default(web)
+  /// Client-supplied idempotency key — prevents duplicate submissions
+  idempotencyKey  String?       @unique
+  placedAt        DateTime      @default(now()) @db.Timestamptz()
+  openedAt        DateTime?     @db.Timestamptz()
+  closedAt        DateTime?     @db.Timestamptz()
+  updatedAt       DateTime      @updatedAt @db.Timestamptz()
+  metadata        Json          @default("{}")
+
+  subIds          OrderSubId[]
+  rejection       OrderRejection?
+
+  @@index([userId, userType, status])
+  @@index([symbol, status])
+  @@index([mamOrderId])
+  @@index([copySourceId])
+  @@index([lpProviderId, placedAt])
+  @@index([idempotencyKey])
+  @@map("orders")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Order Sub-IDs — lifecycle ID registry
+// One row per unique ID sent to the provider per operation type.
+// Replaces flat cancel_id, close_id, stoploss_id columns on the order row.
+// Critical hot-path: callback router does SELECT WHERE lifecycle_id = $1
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OrderSubId {
+  id          BigInt      @id @default(autoincrement())
+  orderId     String
+  order       Order       @relation(fields: [orderId], references: [orderId])
+  idType      SubIdType
+  /// The actual ID value sent to the LP provider
+  lifecycleId String      @unique
+  status      SubIdStatus @default(active)
+  /// lifecycleId of the new ID that replaced this one (on SL/TP modify)
+  replacedBy  String?
+  lpProviderId String?    @db.Uuid
+  notes       String?
+  createdAt   DateTime    @default(now()) @db.Timestamptz()
+  updatedAt   DateTime    @updatedAt @db.Timestamptz()
+
+  @@index([orderId, idType])
+  @@index([lifecycleId])
+  @@map("order_sub_ids")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAM Orders — batch/master order from MAM manager
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MamOrder {
+  id                        String           @id @default(uuid()) @db.Uuid
+  mamAccountId              String           @db.Uuid
+  managerUserId             String           @db.Uuid
+  symbol                    String
+  orderType                 OrderType
+  status                    MamOrderStatus   @default(PENDING)
+  requestedVolume           Decimal          @db.Decimal(12, 4)
+  executedVolume            Decimal          @default(0) @db.Decimal(12, 4)
+  /// Per-order override (default from mam_accounts)
+  allocationMethod          AllocationMethod @default(balance)
+  roundingStrategy          RoundingStrategy @default(symbol_step)
+  totalBalanceSnapshot      Decimal?         @db.Decimal(18, 6)
+  totalFreeMarginSnapshot   Decimal?         @db.Decimal(18, 6)
+  averageEntryPrice         Decimal?         @db.Decimal(18, 8)
+  averageExitPrice          Decimal?         @db.Decimal(18, 8)
+  stopLoss                  Decimal?         @db.Decimal(18, 8)
+  takeProfit                Decimal?         @db.Decimal(18, 8)
+  grossProfit               Decimal?         @db.Decimal(18, 6)
+  netProfitAfterFees        Decimal?         @db.Decimal(18, 6)
+  /// Pre-aggregated — avoids SUM on every WS/API call
+  totalCommission           Decimal          @default(0) @db.Decimal(18, 6)
+  totalSwap                 Decimal          @default(0) @db.Decimal(18, 6)
+  slippageBps               Decimal?         @db.Decimal(10, 4)
+  rejectedInvestorsCount    Int              @default(0)
+  rejectedVolume            Decimal          @default(0) @db.Decimal(12, 4)
+  closeReason               String?
+  /// [{investor_id, pct, lot}...] snapshot at allocation time
+  allocationSnapshot        Json?
+  metadata                  Json             @default("{}")
+  createdAt                 DateTime         @default(now()) @db.Timestamptz()
+  updatedAt                 DateTime         @updatedAt @db.Timestamptz()
+
+  @@index([mamAccountId])
+  @@index([status, createdAt])
+  @@index([managerUserId, status])
+  @@map("mam_orders")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Copy Trade Replications — link between source order & follower orders
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CopyTradeReplication {
+  id              String                @id @default(uuid()) @db.Uuid
+  /// Strategy provider's order_id
+  sourceOrderId   String
+  /// Follower's order_id in orders table
+  followerOrderId String                @unique
+  followerUserId  String                @db.Uuid
+  strategyId      String                @db.Uuid
+  copyRatio       Decimal               @default(1.0) @db.Decimal(6, 4)
+  sourceVolume    Decimal               @db.Decimal(12, 4)
+  followerVolume  Decimal               @db.Decimal(12, 4)
+  status          CopyReplicationStatus @default(REPLICATING)
+  failReason      String?
+  createdAt       DateTime              @default(now()) @db.Timestamptz()
+  updatedAt       DateTime              @updatedAt @db.Timestamptz()
+
+  @@index([sourceOrderId])
+  @@index([followerUserId, status])
+  @@index([strategyId, status])
+  @@map("copy_trade_replications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Order Rejections — audit trail for every rejected order
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OrderRejection {
+  id             BigInt         @id @default(autoincrement())
+  orderId        String?        @unique
+  order          Order?         @relation(fields: [orderId], references: [orderId])
+  userId         String         @db.Uuid
+  userType       String
+  rejectionStage RejectionStage
+  reasonCode     String
+  reasonDetail   String?
+  /// Original order request payload
+  payload        Json?
+  createdAt      DateTime       @default(now()) @db.Timestamptz()
+
+  @@index([userId, createdAt])
+  @@index([orderId])
+  @@index([rejectionStage, createdAt])
+  @@map("order_rejections")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending Order Monitor — crash-recovery registry only
+// Event-driven monitoring via Redis pub/sub happens in Execution Service.
+// On restart: SELECT * FROM here → re-hydrate Redis. NOT used for polling.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PendingOrderMonitor {
+  orderId       String    @id
+  symbol        String
+  orderType     String
+  triggerPrice  Decimal   @db.Decimal(18, 8)
+  userId        String    @db.Uuid
+  lpProviderId  String?   @db.Uuid
+  expiryAt      DateTime? @db.Timestamptz()
+  registeredAt  DateTime  @default(now()) @db.Timestamptz()
+
+  @@index([symbol, orderType])
+  @@map("pending_order_monitor")
+}

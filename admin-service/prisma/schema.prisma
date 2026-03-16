@@ -1,0 +1,285 @@
+// Prisma schema for admin-service → admin_db
+// Database: PostgreSQL 16 (port 5438 in dev)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("ADMIN_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AdminRole {
+  super_admin
+  admin
+  support
+  compliance
+  finance
+}
+
+/// Who sees this announcement
+enum AudienceType {
+  all
+  live
+  demo
+  mam_manager
+  strategy_provider
+  /// Specific group — pair with targetGroups field
+  specific_group
+  /// Specific country — pair with targetCountries field
+  specific_country
+}
+
+/// Why this announcement was created — drives icon and styling in the UI
+enum AnnouncementType {
+  /// Scheduled downtime, maintenance window
+  maintenance
+  /// New product feature or update to existing one
+  feature_update
+  /// Exchange closure, market holiday, early close
+  market_alert
+  /// Legal, compliance, regulatory notice
+  regulatory
+  /// Deposit/withdrawal gateway change or outage
+  deposit_withdrawal
+  /// New app version available, forced upgrade
+  version_update
+  /// General platform-wide message
+  general
+}
+
+/// Urgency — drives delivery channel selection and display priority
+enum AnnouncementPriority {
+  /// Info only, shown in notification centre
+  low
+  /// Shown as banner on dashboard
+  medium
+  /// Full-page interstitial, user must dismiss
+  high
+  /// Sent to ALL channels including SMS; cannot be dismissed until read
+  critical
+}
+
+/// Which channels deliver this announcement
+/// Stored as String[] on the Announcement model
+/// Values: 'in_app' | 'email' | 'push' | 'sms'
+/// in_app  — WebSocket push to connected clients + notification centre
+/// email   — transactional email via SendGrid/SES
+/// push    — FCM/APNs mobile push notification
+/// sms     — Twilio/SNS for critical only
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin Users
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AdminUser {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String
+  fullName     String
+  role         AdminRole @default(support)
+  /// Fine-grained permissions: ['order:close', 'user:edit', 'withdrawal:approve']
+  permissions  String[]
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime? @db.Timestamptz()
+  createdAt    DateTime  @default(now()) @db.Timestamptz()
+  updatedAt    DateTime  @updatedAt @db.Timestamptz()
+
+  auditLogs     AuditLog[]
+  announcements  Announcement[]
+  configUpdates  SystemConfig[]
+  roleAssignments AdminRoleAssignment[]
+
+  @@map("admin_users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Logs — immutable, append-only record of all admin actions
+// Partitioned by month in production
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          BigInt    @id @default(autoincrement())
+  adminId     String    @db.Uuid
+  admin       AdminUser @relation(fields: [adminId], references: [id])
+  /// e.g. 'APPROVE_WITHDRAWAL', 'CLOSE_ORDER', 'SUSPEND_USER', 'CHANGE_LEVERAGE'
+  action      String
+  /// 'user' | 'order' | 'withdrawal' | 'group' | 'strategy'
+  targetType  String
+  targetId    String
+  beforeState Json?
+  afterState  Json?
+  /// INET stored as String (Prisma has no native INET type)
+  ipAddress   String?
+  performedAt DateTime  @default(now()) @db.Timestamptz()
+
+  @@index([adminId, performedAt])
+  @@index([targetType, targetId, performedAt])
+  @@index([action, performedAt])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Announcements — industry-standard multi-channel notification system
+//
+// Read-tracking strategy (NOT in Postgres — would be O(users × announcements)):
+//   Redis SET  announcement_readers:{id}  → SADD userId on read
+//   Redis KEY  user_unread_count:{userId} → INCR/DECR as announcements publish/expire
+//   On login: GET all active announcement IDs, SISMEMBER per ID → unread list
+//   For critical: store ack in announcement_user_acks table (compliance audit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Announcement {
+  id               String               @id @default(uuid()) @db.Uuid
+  /// Shown as notification title / subject line
+  title            String
+  /// Rich text body (stored as Markdown or HTML)
+  body             String
+  /// Short plain-text summary for push notifications (max 120 chars)
+  summary          String?
+  /// Drives icon and category in the UI
+  announcementType AnnouncementType     @default(general)
+  priority         AnnouncementPriority @default(medium)
+  audience         AudienceType         @default(all)
+  /// When specific_group audience: ['Standard','VIP']
+  targetGroups     String[]
+  /// When specific_country audience: ISO 3166-1 alpha-2 codes ['IN','AE']
+  targetCountries  String[]
+  /// Which channels to send on: ['in_app','email','push','sms']
+  deliveryChannels String[]
+  /// Internal draft or ready to schedule
+  isPublished      Boolean              @default(false)
+  /// When to go live (NULL = publish immediately on isPublished=true)
+  scheduledAt      DateTime?            @db.Timestamptz()
+  publishedAt      DateTime?            @db.Timestamptz()
+  /// After expiry: hidden from UI, Redis keys with TTL auto-clean
+  expiresAt        DateTime?            @db.Timestamptz()
+  /// If true: user must explicitly click Dismiss/Acknowledge — stored in acks table
+  requiresAck      Boolean              @default(false)
+  /// External URL for 'Read More' CTA button (optional)
+  ctaUrl           String?
+  ctaLabel         String?
+  /// Kafka event published when this goes live: topic announcement.published
+  kafkaEventId     String?              @unique
+  createdBy        String               @db.Uuid
+  creator          AdminUser            @relation(fields: [createdBy], references: [id])
+  createdAt        DateTime             @default(now()) @db.Timestamptz()
+  updatedAt        DateTime             @updatedAt @db.Timestamptz()
+
+  translations     AnnouncementTranslation[]
+  userAcks         AnnouncementUserAck[]
+
+  @@index([isPublished, audience, scheduledAt, expiresAt])
+  @@index([announcementType, priority, createdAt])
+  @@map("announcements")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Announcement Translations — i18n support
+// Primary language stored on Announcement.title / .body directly.
+// Translations for additional locales stored here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AnnouncementTranslation {
+  id             String       @id @default(uuid()) @db.Uuid
+  announcementId String       @db.Uuid
+  announcement   Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  /// BCP-47 locale: 'ar', 'hi', 'zh-CN', 'es'
+  locale         String
+  title          String
+  body           String
+  summary        String?
+  ctaLabel       String?
+
+  @@unique([announcementId, locale])
+  @@map("announcement_translations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Announcement User Acks — only for requiresAck=true (compliance audit trail)
+// For regular read-tracking use Redis (see comment above)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AnnouncementUserAck {
+  id             String       @id @default(uuid()) @db.Uuid
+  announcementId String       @db.Uuid
+  announcement   Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  userId         String       @db.Uuid
+  userType       String
+  ackedAt        DateTime     @default(now()) @db.Timestamptz()
+  ipAddress      String?
+  deviceId       String?
+
+  @@unique([announcementId, userId, userType])
+  @@index([announcementId])
+  @@index([userId, userType])
+  @@map("announcement_user_acks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// System Config — key-value store for platform-wide settings
+// Managed by admin. Cached in Redis by each service.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SystemConfig {
+  key         String     @id
+  value       Json
+  description String?
+  updatedBy   String?    @db.Uuid
+  updater     AdminUser? @relation(fields: [updatedBy], references: [id])
+  updatedAt   DateTime   @updatedAt @db.Timestamptz()
+
+  @@map("system_config")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RBAC — Roles, Permissions, and Role-Permission mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Role {
+  id          String               @id @default(uuid()) @db.Uuid
+  name        String               @unique
+  description String?
+
+  permissions RolePermission[]
+  admins      AdminRoleAssignment[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String           @id @default(uuid()) @db.Uuid
+  /// e.g. 'order:close', 'user:edit', 'withdrawal:approve', 'leverage:change'
+  name        String           @unique
+  description String?
+
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String     @db.Uuid
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// Maps admin users to roles (many-to-many)
+model AdminRoleAssignment {
+  adminId  String    @db.Uuid
+  admin    AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  roleId   String    @db.Uuid
+  role     Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([adminId, roleId])
+  @@map("admin_role_assignments")
+}

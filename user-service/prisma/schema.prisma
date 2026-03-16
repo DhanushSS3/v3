@@ -1,0 +1,660 @@
+// Prisma schema for user-service → user_db
+// Database: PostgreSQL 16 (port 5433 in dev)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("USER_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum KycStatus {
+  pending
+  submitted
+  approved
+  rejected
+}
+
+enum AllocationMethod {
+  balance
+  free_margin
+  equity
+  lot
+}
+
+enum RoundingStrategy {
+  symbol_step
+  floor
+  ceil
+}
+
+enum StrategyVisibility {
+  public
+  private
+}
+
+enum CommissionType {
+  per_lot
+  per_trade
+  percent
+}
+
+enum CommissionValueType {
+  money
+  percent
+  pips
+}
+
+enum SwapType {
+  pips
+  percent
+  currency
+}
+
+enum MarginCalcMode {
+  /// (contract_size * qty * price) / leverage — Forex, Metals, Indices
+  standard
+  /// (contract_size * qty * price * margin_factor) / leverage — Crypto
+  crypto
+  /// (contract_size * qty * price * margin_pct/100) / leverage — CFD Index
+  cfd_index
+  /// fixed margin per lot regardless of price — some exotics
+  fixed
+}
+
+enum BonusCampaignType {
+  deposit_tiered
+  flat_deposit
+  no_deposit
+  referral
+}
+
+enum BonusType {
+  percent
+  fixed
+}
+
+enum UserBonusStatus {
+  active
+  unlocked
+  withdrawn
+  forfeited
+  expired
+}
+
+enum TransactionType {
+  deposit
+  withdrawal
+  bonus
+  adjustment
+  fee
+  transfer
+}
+
+enum TransactionStatus {
+  pending
+  approved
+  rejected
+  processing
+  completed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live Users
+// ─────────────────────────────────────────────────────────────────────────────
+
+model LiveUser {
+  id                  String    @id @default(uuid()) @db.Uuid
+  /// Legacy MySQL ID for migration mapping
+  externalId          String?   @unique
+  /// Human-readable: LU-2025-000123
+  accountNumber       String    @unique
+  email               String?   @unique
+  phone               String?   @unique
+  passwordHash        String
+  fullName            String
+  countryCode         String?
+  kycStatus           KycStatus @default(pending)
+  groupId             String?   @db.Uuid
+  groupName           String    @default("Standard")
+  leverage            Int       @default(100) @db.SmallInt
+  currency            String    @default("USD")
+  isActive            Boolean   @default(true)
+  isVerified          Boolean   @default(false)
+  referralCode        String?   @unique
+  referredBy          String?   @db.Uuid
+  /// Backward compat — kept encrypted; token-based reset is the primary flow
+  securityQuestion    String?
+  securityAnswerHash  String?
+  lastLoginAt         DateTime? @db.Timestamptz()
+  createdAt           DateTime  @default(now()) @db.Timestamptz()
+  updatedAt           DateTime  @updatedAt @db.Timestamptz()
+  deletedAt           DateTime? @db.Timestamptz()
+
+  kyc                 LiveUserKyc?
+  tradingConfig       UserTradingConfig?
+  lpAssignments       UserLpAssignment[]
+  mamAccountsManaged  MamAccount[]        @relation("MamManager")
+  mamInvestments      MamInvestor[]
+  strategyProvider    StrategyProvider?
+  copyFollowings      CopyFollower[]
+  transactions        UserTransaction[]
+  bonusAllocations    UserBonusAllocation[]
+
+  @@index([groupName])
+  @@index([isActive, kycStatus])
+  @@index([accountNumber])
+  @@map("live_users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Demo Users
+// ─────────────────────────────────────────────────────────────────────────────
+
+model DemoUser {
+  id            String   @id @default(uuid()) @db.Uuid
+  accountNumber String   @unique
+  email         String?  @unique
+  phone         String?  @unique
+  passwordHash  String
+  fullName      String
+  groupName     String   @default("Standard")
+  leverage      Int      @default(100) @db.SmallInt
+  currency      String   @default("USD")
+  demoBalance   Decimal  @default(10000.00) @db.Decimal(18, 6)
+  isActive      Boolean  @default(true)
+  lastLoginAt   DateTime? @db.Timestamptz()
+  createdAt     DateTime @default(now()) @db.Timestamptz()
+  updatedAt     DateTime @updatedAt @db.Timestamptz()
+
+  @@map("demo_users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KYC & Bank Details — 1:1 with live_users
+// Only readable by compliance/admin roles (enforced in API layer)
+// KYC proof files stored in S3 — only paths stored here
+// ─────────────────────────────────────────────────────────────────────────────
+
+model LiveUserKyc {
+  userId             String    @id @db.Uuid
+  user               LiveUser  @relation(fields: [userId], references: [id])
+  addressLine1       String?
+  addressLine2       String?
+  city               String?
+  state              String?
+  country            String?
+  pincode            String?
+  bankName           String?
+  bankIfscCode       String?
+  bankAccountNumber  String?
+  bankHolderName     String?
+  /// 'passport' | 'driving_license' | 'national_id'
+  idProofType        String?
+  /// S3 path: s3://bucket/kyc/{userId}/id_front.jpg
+  idProofPath        String?
+  idProofBackPath    String?
+  /// 'utility_bill' | 'bank_statement'
+  addressProofType   String?
+  addressProofPath   String?
+  selfiePath         String?
+  reviewedBy         String?   @db.Uuid
+  reviewedAt         DateTime? @db.Timestamptz()
+  rejectionReason    String?
+  submittedAt        DateTime? @db.Timestamptz()
+  updatedAt          DateTime  @updatedAt @db.Timestamptz()
+
+  @@map("live_user_kyc")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User Trading Config — 1:1 with live_users
+// Replaces flat boolean flags scattered on the user row
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserTradingConfig {
+  userId                String   @id @db.Uuid
+  user                  LiveUser @relation(fields: [userId], references: [id])
+  manualTradingEnabled  Boolean  @default(true)
+  algoTradingEnabled    Boolean  @default(false)
+  copyTradingEnabled    Boolean  @default(false)
+  mamEnabled            Boolean  @default(false)
+  pamEnabled            Boolean  @default(false)
+  activeMamAccountId    String?  @db.Uuid
+  activePamAccountId    String?  @db.Uuid
+  activeStrategyId      String?  @db.Uuid
+  copyRatio             Decimal? @db.Decimal(6, 4)
+  /// Read-only account access password (view_password in V1)
+  viewPasswordHash      String?
+  /// 'A' or 'B' book designation
+  book                  String?  @db.VarChar(5)
+  updatedAt             DateTime @updatedAt @db.Timestamptz()
+
+  @@map("user_trading_config")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LP Provider Assignment — replaces sending_orders:'rock' magic string
+// Which LP handles this user's orders, with routing mode and effective dates
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserLpAssignment {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @db.Uuid
+  user           LiveUser  @relation(fields: [userId], references: [id])
+  userType       String
+  /// Logical LP name — matches lp_providers.name in order_db
+  lpProviderName String
+  /// 'external_lp' | 'local_book' | 'hybrid'
+  routingMode    String    @default("external_lp")
+  /// NULL = all order types; e.g. ['BUY','SELL']
+  orderTypes     String[]
+  isActive       Boolean   @default(true)
+  effectiveFrom  DateTime  @default(now()) @db.Timestamptz()
+  effectiveUntil DateTime? @db.Timestamptz()
+  assignedBy     String?   @db.Uuid
+  notes          String?
+  createdAt      DateTime  @default(now()) @db.Timestamptz()
+
+  @@index([userId, userType])
+  @@index([lpProviderName])
+  @@map("user_lp_assignment")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAM Accounts — one per MAM manager, holds default allocation config
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MamAccount {
+  id                  String           @id @default(uuid()) @db.Uuid
+  managerUserId       String           @db.Uuid
+  manager             LiveUser         @relation("MamManager", fields: [managerUserId], references: [id])
+  accountName         String
+  /// Default for mam_orders — can be overridden per order
+  allocationMethod    AllocationMethod @default(balance)
+  roundingStrategy    RoundingStrategy @default(symbol_step)
+  performanceFeePct   Decimal          @default(0) @db.Decimal(5, 2)
+  managementFeePct    Decimal          @default(0) @db.Decimal(5, 2)
+  minDeposit          Decimal          @default(0) @db.Decimal(18, 6)
+  /// % margin level at which auto-cutoff triggers
+  autoCutoffLevel     Decimal          @default(50.00) @db.Decimal(5, 2)
+  isActive            Boolean          @default(true)
+  isPublic            Boolean          @default(false)
+  description         String?
+  createdAt           DateTime         @default(now()) @db.Timestamptz()
+  updatedAt           DateTime         @updatedAt @db.Timestamptz()
+
+  investors           MamInvestor[]
+
+  @@index([managerUserId])
+  @@map("mam_accounts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAM Investors
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MamInvestor {
+  id              String     @id @default(uuid()) @db.Uuid
+  mamAccountId    String     @db.Uuid
+  mamAccount      MamAccount @relation(fields: [mamAccountId], references: [id])
+  investorUserId  String     @db.Uuid
+  investor        LiveUser   @relation(fields: [investorUserId], references: [id])
+  investedAt      DateTime   @default(now()) @db.Timestamptz()
+  removedAt       DateTime?  @db.Timestamptz()
+  initialBalance  Decimal    @db.Decimal(18, 6)
+
+  @@unique([mamAccountId, investorUserId])
+  @@index([mamAccountId])
+  @@index([investorUserId])
+  @@map("mam_investors")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Strategy Providers
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StrategyProvider {
+  id                   String             @id @default(uuid()) @db.Uuid
+  userId               String             @unique @db.Uuid
+  user                 LiveUser           @relation(fields: [userId], references: [id])
+  /// e.g. SP-2025-000001
+  accountNumber        String             @unique
+  strategyName         String             @unique
+  description          String?
+  groupName            String             @default("Standard")
+  leverage             Int                @default(100) @db.SmallInt
+  visibility           StrategyVisibility @default(public)
+  /// Random 16-byte hex for private strategy invitation links
+  accessToken          String?            @unique
+  performanceFeePct    Decimal            @default(20.00) @db.Decimal(5, 2)
+  maxLeverage          Int                @default(100) @db.SmallInt
+  minInvestment        Decimal            @default(100.00) @db.Decimal(18, 6)
+  maxTotalInvestment   Decimal            @default(500000.00) @db.Decimal(18, 6)
+  maxFollowers         Int                @default(1000)
+  autoCutoffLevel      Decimal            @default(50.00) @db.Decimal(5, 2)
+  isCatalogEligible    Boolean            @default(false)
+  isTrustworthy        Boolean            @default(false)
+  catalogFreePass      Boolean            @default(false)
+  firstTradeDate       DateTime?          @db.Timestamptz()
+  lastTradeDate        DateTime?          @db.Timestamptz()
+  isActive             Boolean            @default(true)
+  isArchived           Boolean            @default(false)
+  archivedAt           DateTime?          @db.Timestamptz()
+  profileImageUrl      String?
+  lastLoginAt          DateTime?          @db.Timestamptz()
+  createdAt            DateTime           @default(now()) @db.Timestamptz()
+  updatedAt            DateTime           @updatedAt @db.Timestamptz()
+
+  stats                StrategyProviderStats?
+  followers            CopyFollower[]
+
+  @@index([userId])
+  @@index([isCatalogEligible, isActive, visibility])
+  @@map("strategy_providers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Strategy Provider Stats — pre-computed cache, updated async on trade close
+// Never computed live — always read from this table
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StrategyProviderStats {
+  strategyId               String           @id @db.Uuid
+  strategy                 StrategyProvider @relation(fields: [strategyId], references: [id])
+  totalFollowers           Int              @default(0)
+  totalFollowerInvestment  Decimal          @default(0) @db.Decimal(18, 6)
+  providerOwnInvestment    Decimal          @default(0) @db.Decimal(18, 6)
+  totalTrades              Int              @default(0)
+  closedTrades             Int              @default(0)
+  winningTrades            Int              @default(0)
+  winRatePct               Decimal          @default(0) @db.Decimal(5, 2)
+  totalReturnPct           Decimal          @default(0) @db.Decimal(8, 4)
+  threeMonthReturnPct      Decimal          @default(0) @db.Decimal(8, 4)
+  maxDrawdownPct           Decimal          @default(0) @db.Decimal(8, 4)
+  sharpeRatio              Decimal?         @db.Decimal(8, 4)
+  avgTradeDurationSec      Int?
+  lastComputedAt           DateTime         @default(now()) @db.Timestamptz()
+
+  @@map("strategy_provider_stats")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Copy Followers — one row per (strategy × follower) subscription
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CopyFollower {
+  id             String           @id @default(uuid()) @db.Uuid
+  strategyId     String           @db.Uuid
+  strategy       StrategyProvider @relation(fields: [strategyId], references: [id])
+  followerUserId String           @db.Uuid
+  follower       LiveUser         @relation(fields: [followerUserId], references: [id])
+
+  // ── Copy ratio & lot cap ───────────────────────────────────────────────────
+  copyRatio      Decimal          @default(1.0) @db.Decimal(6, 4)
+  maxLotPerTrade Decimal?         @db.Decimal(12, 4)
+  investedAmount Decimal          @default(0) @db.Decimal(18, 6)
+
+  // ── SL modification for follower orders ───────────────────────────────────
+  /// 'none' | 'percentage' | 'amount' — how follower adjusts the copied SL
+  copySLMode       String          @default("none") @db.VarChar(20)
+  slPercentage     Decimal?        @db.Decimal(5, 2)
+  slAmount         Decimal?        @db.Decimal(18, 6)
+
+  // ── TP modification for follower orders ───────────────────────────────────
+  /// 'none' | 'percentage' | 'amount' — how follower adjusts the copied TP
+  copyTPMode       String          @default("none") @db.VarChar(20)
+  tpPercentage     Decimal?        @db.Decimal(5, 2)
+  tpAmount         Decimal?        @db.Decimal(18, 6)
+
+  // ── Risk management ───────────────────────────────────────────────────────
+  /// Auto-stop copying if strategy drawdown exceeds this % (e.g. 20.00 = 20%)
+  stopCopyingOnDrawdownPct  Decimal?   @db.Decimal(5, 2)
+  maxDailyLoss              Decimal?   @db.Decimal(18, 6)
+
+  // ── Copy status ───────────────────────────────────────────────────────────
+  /// 'active' | 'paused' | 'stopped'
+  copyStatus     String           @default("active") @db.VarChar(20)
+  pauseReason    String?
+  stopReason     String?
+  lastCopyAt     DateTime?        @db.Timestamptz()
+
+  startedAt      DateTime         @default(now()) @db.Timestamptz()
+  stoppedAt      DateTime?        @db.Timestamptz()
+
+  @@unique([strategyId, followerUserId])
+  @@index([strategyId, copyStatus])
+  @@index([followerUserId, copyStatus])
+  @@map("copy_followers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Groups — trading groups (Standard, Premium, VIP, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Group {
+  id                String        @id @default(uuid()) @db.Uuid
+  name              String        @unique
+  description       String?
+  isActive          Boolean       @default(true)
+  /// 'standard' | 'cent' | 'islamic'
+  accountVariant    String        @default("standard") @db.VarChar(20)
+  /// 1 for standard/islamic, 100 for cent. UI multiplies all monetary values by this.
+  displayMultiplier Int           @default(1)
+  createdAt         DateTime      @default(now()) @db.Timestamptz()
+  updatedAt         DateTime      @updatedAt @db.Timestamptz()
+
+  symbols           GroupSymbol[]
+
+  @@index([accountVariant])
+  @@map("groups")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Symbols — trading config per group × symbol combination
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GroupSymbol {
+  id                  String             @id @default(uuid()) @db.Uuid
+  groupId             String             @db.Uuid
+  group               Group              @relation(fields: [groupId], references: [id])
+  symbol              String
+  // Spread
+  /// 'variable' = markup added on top of LP's spread (client sees varying total)
+  /// 'fixed'    = client always sees exactly spread pips (broker absorbs LP widening)
+  spreadType          String             @default("variable") @db.VarChar(20)
+  spread              Decimal            @default(0) @db.Decimal(10, 5)
+  spreadPip           Decimal            @default(1) @db.Decimal(10, 5)
+  /// For variable mode only: cap the final spread at this value (e.g. 10 pips during news)
+  maxSpread           Decimal?           @db.Decimal(10, 5)
+  // Swap
+  swapBuy             Decimal            @default(0) @db.Decimal(10, 4)
+  swapSell            Decimal            @default(0) @db.Decimal(10, 4)
+  swapType            SwapType           @default(pips)
+  // Commission
+  commission          Decimal            @default(0) @db.Decimal(10, 5)
+  commissionType      CommissionType     @default(per_lot)
+  commissionValueType CommissionValueType @default(money)
+  // Margin
+  marginPct           Decimal            @default(1) @db.Decimal(8, 4)
+  /// Drives margin calculation formula — replaces if(instrument_type==4) hardcoding
+  marginCalcMode      MarginCalcMode     @default(standard)
+  /// Multiplier used when marginCalcMode = 'crypto' or 'fixed'
+  marginFactor        Decimal            @default(1.0) @db.Decimal(10, 6)
+  // Lot constraints
+  minLot              Decimal            @default(0.01) @db.Decimal(12, 4)
+  maxLot              Decimal            @default(100) @db.Decimal(12, 4)
+  lotStep             Decimal            @default(0.01) @db.Decimal(12, 4)
+  // Instrument details
+  contractSize        Decimal            @default(100000) @db.Decimal(18, 4)
+  /// Result currency for P&L calc. e.g. 'USD' for XAUUSD, 'JPY' for USDJPY
+  profitCurrency      String             @default("USD")
+  pipCurrency         String?
+  pips                Decimal            @default(0.0001) @db.Decimal(10, 4)
+  /// Decimal places shown to user (V1 show_points)
+  showPoints          Int                @default(5) @db.SmallInt
+  /// 0=forex, 1=metal, 2=index, 3=commodity, 4=crypto
+  instrumentType      Int                @default(0) @db.SmallInt
+  // Order execution
+  /// Max slippage tolerance in pips (V1 deviaton)
+  deviation           Decimal            @default(0) @db.Decimal(10, 4)
+  /// Bonus points per lot (V1 bonus)
+  bonus               Decimal            @default(0) @db.Decimal(10, 4)
+  isTradable          Boolean            @default(true)
+
+  @@unique([groupId, symbol])
+  @@index([groupId])
+  @@index([symbol])
+  @@map("group_symbols")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Market Sessions — when each symbol can be traded
+// Separate from group_symbols: market hours are instrument-level, not per-group
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MarketSession {
+  id        String  @id @default(uuid()) @db.Uuid
+  symbol    String
+  /// 0 = Sunday, 1 = Monday, ... 6 = Saturday
+  dayOfWeek Int     @db.SmallInt
+  /// 'HH:MM' in UTC e.g. '00:00'
+  openTime  String
+  /// 'HH:MM' in UTC e.g. '23:59'
+  closeTime String
+  timezone  String  @default("UTC")
+  isActive  Boolean @default(true)
+
+  @@unique([symbol, dayOfWeek])
+  @@index([symbol, isActive])
+  @@map("market_sessions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Market Holidays — exchange holiday closures
+// NULL symbol = applies to all symbols (e.g. Christmas)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MarketHoliday {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// NULL = applies to all symbols
+  symbol      String?
+  holidayDate DateTime @db.Date
+  description String?
+
+  @@unique([symbol, holidayDate])
+  @@map("market_holidays")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User Transactions — deposits, withdrawals, bonuses (partitioned by month in prod)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserTransaction {
+  id            String            @id @default(uuid()) @db.Uuid
+  userId        String            @db.Uuid
+  user          LiveUser          @relation(fields: [userId], references: [id])
+  userType      String
+  txnType       TransactionType
+  amount        Decimal           @db.Decimal(18, 6)
+  currency      String            @default("USD")
+  status        TransactionStatus @default(pending)
+  gateway       String?
+  gatewayTxnId  String?
+  notes         String?
+  processedBy   String?           @db.Uuid
+  createdAt     DateTime          @default(now()) @db.Timestamptz()
+  updatedAt     DateTime          @updatedAt @db.Timestamptz()
+
+  bonusAllocations UserBonusAllocation[]
+
+  @@index([userId, userType, txnType])
+  @@index([status, createdAt])
+  @@map("user_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bonus Campaigns — admin-configured bonus programs
+// ─────────────────────────────────────────────────────────────────────────────
+
+model BonusCampaign {
+  id           String            @id @default(uuid()) @db.Uuid
+  name         String
+  description  String?
+  campaignType BonusCampaignType @default(deposit_tiered)
+  isActive     Boolean           @default(true)
+  startsAt     DateTime          @default(now()) @db.Timestamptz()
+  endsAt       DateTime?         @db.Timestamptz()
+  createdBy    String?           @db.Uuid
+  createdAt    DateTime          @default(now()) @db.Timestamptz()
+
+  tiers        BonusCampaignTier[]
+  allocations  UserBonusAllocation[]
+
+  @@map("bonus_campaigns")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bonus Campaign Tiers — the deposit → bonus rows from the image
+// ─────────────────────────────────────────────────────────────────────────────
+
+model BonusCampaignTier {
+  id                   String        @id @default(uuid()) @db.Uuid
+  campaignId           String        @db.Uuid
+  campaign             BonusCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  minDeposit           Decimal       @db.Decimal(18, 6)
+  maxDeposit           Decimal?      @db.Decimal(18, 6)
+  bonusType            BonusType     @default(percent)
+  bonusValue           Decimal       @db.Decimal(8, 4)
+  /// Lots the user must trade before bonus is withdrawable
+  minLotsToUnlock      Decimal       @default(0) @db.Decimal(12, 4)
+  /// bonus × this% = required lots (matches image: bonus × 20% = lots)
+  withdrawalUnlockPct  Decimal       @default(20.0) @db.Decimal(5, 2)
+  maxBonusCap          Decimal?      @db.Decimal(18, 6)
+  sortOrder            Int           @default(0) @db.SmallInt
+
+  allocations          UserBonusAllocation[]
+
+  @@index([campaignId, minDeposit])
+  @@map("bonus_campaign_tiers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User Bonus Allocations — per-user bonus tracking
+// lots_traded updated async by Kafka consumer on order close
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserBonusAllocation {
+  id              String             @id @default(uuid()) @db.Uuid
+  userId          String             @db.Uuid
+  user            LiveUser           @relation(fields: [userId], references: [id])
+  userType        String
+  campaignId      String             @db.Uuid
+  campaign        BonusCampaign      @relation(fields: [campaignId], references: [id])
+  tierId          String?            @db.Uuid
+  tier            BonusCampaignTier? @relation(fields: [tierId], references: [id])
+  depositAmount   Decimal            @db.Decimal(18, 6)
+  bonusAmount     Decimal            @db.Decimal(18, 6)
+  /// Total lots user must trade to unlock withdrawal
+  lotsRequired    Decimal            @default(0) @db.Decimal(12, 4)
+  /// Running total — incremented on each trade close
+  lotsTraded      Decimal            @default(0) @db.Decimal(12, 4)
+  status          UserBonusStatus    @default(active)
+  creditedAt      DateTime           @default(now()) @db.Timestamptz()
+  unlockedAt      DateTime?          @db.Timestamptz()
+  expiresAt       DateTime?          @db.Timestamptz()
+  triggeringTxnId String?            @db.Uuid
+  triggeringTxn   UserTransaction?   @relation(fields: [triggeringTxnId], references: [id])
+  createdAt       DateTime           @default(now()) @db.Timestamptz()
+  updatedAt       DateTime           @updatedAt @db.Timestamptz()
+
+  @@index([userId, status])
+  @@index([status, lotsTraded])
+  @@map("user_bonus_allocations")
+}

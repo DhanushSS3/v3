@@ -1,0 +1,103 @@
+// Prisma schema for risk-service → risk_db
+// Database: PostgreSQL 16 (port 5436 in dev)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("RISK_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum RuleScope {
+  global
+  group
+  user
+  symbol
+}
+
+enum RuleType {
+  max_open_orders
+  max_lot_per_trade
+  max_total_lot
+  max_daily_loss
+  max_drawdown_pct
+  prohibited_symbol
+  min_margin_level
+  max_leverage
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk Rules — configurable per scope (global / group / user / symbol)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model RiskRule {
+  id          String    @id @default(uuid()) @db.Uuid
+  scope       RuleScope
+  /// group_name | user_id (UUID string) | symbol string — NULL for global
+  scopeValue  String?
+  ruleType    RuleType
+  ruleValue   Decimal?  @db.Decimal(18, 6)
+  /// Extra config — e.g. { "symbols": ["BTCUSD","ETHUSD"] } for prohibited_symbol
+  ruleConfig  Json      @default("{}")
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now()) @db.Timestamptz()
+  updatedAt   DateTime  @updatedAt @db.Timestamptz()
+
+  @@index([scope, scopeValue])
+  @@map("risk_rules")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk Check Log — immutable audit trail of every order's risk evaluation
+// Partitioned by month in production
+// ─────────────────────────────────────────────────────────────────────────────
+
+model RiskCheckLog {
+  id               BigInt   @id @default(autoincrement())
+  orderId          String
+  userId           String   @db.Uuid
+  /// true = all risk checks passed; false = at least one failed
+  passed           Boolean
+  /// [{rule, passed, detail}] — full breakdown of each check run
+  checksRun        Json
+  marginRequired   Decimal? @db.Decimal(18, 6)
+  marginAvailable  Decimal? @db.Decimal(18, 6)
+  evaluatedAt      DateTime @default(now()) @db.Timestamptz()
+
+  @@index([orderId])
+  @@index([userId, evaluatedAt])
+  @@index([evaluatedAt])
+  @@map("risk_check_log")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User Risk Profiles — live risk metrics per user
+// Updated by Risk Service on every order state change via Kafka consumer.
+// Primary use: margin level monitoring, auto-cutoff decisions.
+// Redis cache mirrors this — Postgres is the durable source of truth.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserRiskProfile {
+  userId          String   @id @db.Uuid
+  /// 'live' | 'demo' | 'strategy_provider'
+  userType        String
+  balance         Decimal  @default(0) @db.Decimal(18, 6)
+  equity          Decimal  @default(0) @db.Decimal(18, 6)
+  marginUsed      Decimal  @default(0) @db.Decimal(18, 6)
+  freeMargin      Decimal  @default(0) @db.Decimal(18, 6)
+  /// equity / margin_used * 100 — NULL when no open orders
+  marginLevelPct  Decimal? @db.Decimal(10, 4)
+  openOrders      Int      @default(0)
+  floatingPnl     Decimal  @default(0) @db.Decimal(18, 6)
+  dailyLoss       Decimal  @default(0) @db.Decimal(18, 6)
+  dailyLossDate   DateTime? @db.Date
+  lastUpdatedAt   DateTime @default(now()) @db.Timestamptz()
+
+  @@map("user_risk_profiles")
+}

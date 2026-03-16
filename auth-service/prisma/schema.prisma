@@ -1,0 +1,202 @@
+// This is the Prisma schema for auth-service → auth_db
+// Database: PostgreSQL 16 (port 5432 in dev)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("AUTH_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserType {
+  live
+  demo
+  mam_manager
+  strategy_provider
+  admin
+}
+
+enum OtpPurpose {
+  login
+  forgot_password
+  email_verify
+  phone_verify
+  withdrawal_confirm
+  twofa_setup
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sessions — one row per active JWT token
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Session {
+  id              String    @id @default(uuid()) @db.Uuid
+  userId          String    @db.Uuid
+  userType        UserType
+  /// SHA-256 of the JWT JTI — never store the raw token
+  tokenHash       String    @unique
+  refreshHash     String?   @unique
+  issuedAt        DateTime  @default(now()) @db.Timestamptz()
+  expiresAt       DateTime  @db.Timestamptz()
+  revokedAt       DateTime? @db.Timestamptz()
+  ipAddress       String?
+  userAgent       String?
+  deviceId        String?
+  fingerprintHash String?
+
+  @@index([userId, userType])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Known devices — for new-device login alerts
+// ─────────────────────────────────────────────────────────────────────────────
+
+model KnownDevice {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  userType        UserType
+  fingerprintHash String
+  /// e.g. "Chrome on Windows 11"
+  label           String?
+  firstSeenAt     DateTime @default(now()) @db.Timestamptz()
+  lastSeenAt      DateTime @default(now()) @updatedAt @db.Timestamptz()
+
+  @@unique([userId, userType, fingerprintHash])
+  @@map("known_devices")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Keys — for Algo Trading external systems
+// key_hash = SHA-256(rawKey). Raw key shown to user exactly once, never stored.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ApiKey {
+  id          String               @id @default(uuid()) @db.Uuid
+  userId      String               @db.Uuid
+  userType    UserType
+  /// SHA-256 of raw API key — never stored plaintext
+  keyHash     String               @unique
+  label       String?
+  /// e.g. ['ORDER_CREATE', 'ORDER_READ', 'PORTFOLIO_READ']
+  permissions String[]
+  createdAt   DateTime             @default(now()) @db.Timestamptz()
+  expiresAt   DateTime?            @db.Timestamptz()
+  lastUsedAt  DateTime?            @db.Timestamptz()
+  revokedAt   DateTime?            @db.Timestamptz()
+
+  ipWhitelist ApiKeyIpWhitelist[]
+
+  @@index([userId, userType])
+  @@map("api_keys")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Key IP Whitelist — multiple named IPs per key, with expiry
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ApiKeyIpWhitelist {
+  id        String    @id @default(uuid()) @db.Uuid
+  apiKeyId  String    @db.Uuid
+  apiKey    ApiKey    @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  /// INET stored as TEXT — Prisma doesn't have a native INET type
+  ipAddress String
+  /// e.g. "Trading Server NYC", "Office London"
+  label     String?
+  isActive  Boolean   @default(true)
+  addedBy   String?   @db.Uuid
+  expiresAt DateTime? @db.Timestamptz()
+  createdAt DateTime  @default(now()) @db.Timestamptz()
+
+  @@unique([apiKeyId, ipAddress])
+  @@index([apiKeyId])
+  @@map("api_key_ip_whitelist")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP Attempts — hashed OTPs for login, password reset, withdrawal confirm, etc.
+// otpHash = bcrypt(rawOtp) — raw OTP never stored
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OtpAttempt {
+  id         BigInt    @id @default(autoincrement())
+  /// phone number or email address
+  identifier String
+  purpose    OtpPurpose
+  /// bcrypt hash of the raw 6-digit OTP
+  otpHash    String
+  attempts   Int       @default(0) @db.SmallInt
+  verifiedAt DateTime? @db.Timestamptz()
+  expiresAt  DateTime  @db.Timestamptz()
+  createdAt  DateTime  @default(now()) @db.Timestamptz()
+
+  @@index([identifier, purpose, expiresAt])
+  @@map("otp_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Password Reset Tokens — time-limited signed link (industry standard)
+// Replaces security questions as primary reset mechanism
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  userType  UserType
+  /// SHA-256 of token sent in reset email/SMS
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz()
+  usedAt    DateTime? @db.Timestamptz()
+  createdAt DateTime  @default(now()) @db.Timestamptz()
+
+  @@index([tokenHash])
+  @@map("password_reset_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOTP Secrets — Google Authenticator / Authy style 2FA
+// secretEnc = AES-256-GCM encrypted TOTP secret base32 string
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserTotpSecret {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  userType   UserType
+  /// AES-256-GCM encrypted TOTP secret — never stored plaintext
+  secretEnc  String
+  /// false until user scans QR and confirms first code
+  isVerified Boolean   @default(false)
+  enabledAt  DateTime? @db.Timestamptz()
+  disabledAt DateTime? @db.Timestamptz()
+  createdAt  DateTime  @default(now()) @db.Timestamptz()
+
+  @@unique([userId, userType])
+  @@map("user_totp_secrets")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trusted Devices — skip 2FA for N days on recognised device fingerprints
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TrustedDevice {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  userType        UserType
+  fingerprintHash String
+  /// e.g. "iPhone 15 Pro — Safari"
+  label           String?
+  /// NOW() + 30 days when device is trusted
+  trustedUntil    DateTime @db.Timestamptz()
+  createdAt       DateTime @default(now()) @db.Timestamptz()
+
+  @@unique([userId, userType, fingerprintHash])
+  @@index([userId, fingerprintHash, trustedUntil])
+  @@map("trusted_devices")
+}
