@@ -31,6 +31,15 @@ enum OtpPurpose {
   twofa_setup
 }
 
+enum ApiKeyType {
+  /// Server-generated HMAC key — SHA-256 of raw key stored as keyHash
+  hmac
+  /// User-provided RSA public key (≥ 2048-bit)
+  rsa
+  /// User-provided Ed25519 public key
+  ed25519
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sessions — one row per active JWT token
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,18 +88,22 @@ model KnownDevice {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model ApiKey {
-  id          String               @id @default(uuid()) @db.Uuid
-  userId      String               @db.Uuid
+  id          String      @id @default(uuid()) @db.Uuid
+  userId      String      @db.Uuid
   userType    UserType
-  /// SHA-256 of raw API key — never stored plaintext
-  keyHash     String               @unique
-  label       String?
-  /// e.g. ['ORDER_CREATE', 'ORDER_READ', 'PORTFOLIO_READ']
+  keyType     ApiKeyType  @default(hmac)
+  /// SHA-256 of raw HMAC key — null for RSA/Ed25519 keys
+  keyHash     String?     @unique
+  /// PEM public key for RSA/Ed25519 self-generated keys — null for HMAC keys  
+  publicKey   String?
+  label       String
+  /// Default: ['READ'] — editable after creation
   permissions String[]
-  createdAt   DateTime             @default(now()) @db.Timestamptz()
-  expiresAt   DateTime?            @db.Timestamptz()
-  lastUsedAt  DateTime?            @db.Timestamptz()
-  revokedAt   DateTime?            @db.Timestamptz()
+  createdAt   DateTime    @default(now()) @db.Timestamptz()
+  updatedAt   DateTime    @updatedAt @db.Timestamptz()
+  expiresAt   DateTime?   @db.Timestamptz()
+  lastUsedAt  DateTime?   @db.Timestamptz()
+  revokedAt   DateTime?   @db.Timestamptz()
 
   ipWhitelist ApiKeyIpWhitelist[]
 

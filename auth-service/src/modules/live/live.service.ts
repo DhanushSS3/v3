@@ -16,25 +16,25 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   const accountNumber = await generateAccountNumber('LU');
   const passwordHash = await hashPassword(input.password);
 
-  // Publish to Kafka → user-service will create the actual user row
+  // Publish to Kafka → user-service will:
+  //   1. Check phone uniqueness across all accounts (block if same phone exists)
+  //   2. Create the actual user row
+  //   isSelfTrading is always true for self-registered users
+  //   leverage is always 100 by default
   await publishEvent('user.register', accountNumber, {
     type: 'LIVE_USER_REGISTER',
     accountNumber,
     passwordHash,
     email: input.email,
-    name: input.name,
     phoneNumber: input.phoneNumber,
     country: input.country,
-    city: input.city,
-    state: input.state ?? null,
-    pincode: input.pincode ?? null,
     groupName: input.groupName,
-    currency: input.currency,
-    leverage: input.leverage,
-    isSelfTrading: input.isSelfTrading,
+    currency: 'USD',
+    leverage: 100,
+    isSelfTrading: true,
   });
 
-  // Send welcome/verification email with OTP
+  // Send email verification OTP
   const otp = await createOtp(input.email, 'email_verify');
   await sendMail({
     to: input.email,
