@@ -227,6 +227,7 @@ services:
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic risk.check.request --partitions 6 --replication-factor 1
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic portfolio.update --partitions 6 --replication-factor 1
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic bonus.lots.update --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic user.register --partitions 6 --replication-factor 1
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic announcement.published --partitions 3 --replication-factor 1
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic notification.push --partitions 3 --replication-factor 1
       echo 'All Kafka topics created.'
