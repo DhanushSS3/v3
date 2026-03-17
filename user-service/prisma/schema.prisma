@@ -115,21 +115,23 @@ model LiveUser {
   externalId          String?   @unique
   /// Human-readable: LU-2025-000123
   accountNumber       String    @unique
-  email               String?   @unique
-  phone               String?   @unique
+  /// Multiple accounts allowed per email — NOT unique
+  email               String
+  /// Global unique: same phone cannot register with a different email
+  phone               String    @unique
   passwordHash        String
-  fullName            String
   countryCode         String?
   kycStatus           KycStatus @default(pending)
   groupId             String?   @db.Uuid
   groupName           String    @default("Standard")
   leverage            Int       @default(100) @db.SmallInt
   currency            String    @default("USD")
+  /// True when the user registered themselves; false when created by admin
+  isSelfTrading       Boolean   @default(true)
   isActive            Boolean   @default(true)
   isVerified          Boolean   @default(false)
   referralCode        String?   @unique
   referredBy          String?   @db.Uuid
-  /// Backward compat — kept encrypted; token-based reset is the primary flow
   securityQuestion    String?
   securityAnswerHash  String?
   lastLoginAt         DateTime? @db.Timestamptz()
@@ -147,6 +149,7 @@ model LiveUser {
   transactions        UserTransaction[]
   bonusAllocations    UserBonusAllocation[]
 
+  @@index([email])          // Not unique — index only
   @@index([groupName])
   @@index([isActive, kycStatus])
   @@index([accountNumber])
@@ -160,10 +163,10 @@ model LiveUser {
 model DemoUser {
   id            String   @id @default(uuid()) @db.Uuid
   accountNumber String   @unique
-  email         String?  @unique
+  email         String?
   phone         String?  @unique
   passwordHash  String
-  fullName      String
+  fullName      String?
   groupName     String   @default("Standard")
   leverage      Int      @default(100) @db.SmallInt
   currency      String   @default("USD")

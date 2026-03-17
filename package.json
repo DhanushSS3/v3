@@ -1,0 +1,32 @@
+{
+  "name": "@livefxhub/v3",
+  "private": true,
+  "version": "1.0.0",
+  "description": "LiveFXHub V3 — Microservices Monorepo",
+  "workspaces": [
+    "auth-service",
+    "user-service",
+    "admin-service",
+    "order-gateway",
+    "execution-service",
+    "risk-service",
+    "analytics-service"
+  ],
+  "scripts": {
+    "dev": "concurrently --names \"AUTH,USER,ADMIN\" --prefix-colors \"cyan,green,yellow\" \"npm run dev -w auth-service\" \"npm run dev -w user-service\" \"npm run dev -w admin-service\"",
+    "dev:all": "concurrently --names \"AUTH,USER,ADMIN,GW,EXEC,RISK\" --prefix-colors \"cyan,green,yellow,magenta,blue,red\" \"npm run dev -w auth-service\" \"npm run dev -w user-service\" \"npm run dev -w admin-service\" \"npm run dev -w order-gateway\" \"npm run dev -w execution-service\" \"npm run dev -w risk-service\"",
+    "dev:auth": "npm run dev -w auth-service",
+    "dev:user": "npm run dev -w user-service",
+    "dev:admin": "npm run dev -w admin-service",
+    "dev:gateway": "npm run dev -w order-gateway",
+    "infra:up": "docker compose -f docker-compose.dev.yml --profile localdb --profile messaging up -d",
+    "infra:up:messaging": "docker compose -f docker-compose.dev.yml --profile messaging up -d",
+    "infra:down": "docker compose -f docker-compose.dev.yml down",
+    "infra:logs": "docker compose -f docker-compose.dev.yml logs -f",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
