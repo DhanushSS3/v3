@@ -65,7 +65,84 @@ router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: R
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TOTP
+// Email Verification
+// ─────────────────────────────────────────────────────────────────────────────
+
+const verifyEmailSchema = z.object({
+  email: z.string().email(),
+  otp:   z.string().length(6),
+});
+
+/**
+ * POST /api/auth/verify-email
+ *
+ * Step-2 of the registration flow. The user submits the 6-digit OTP that was
+ * emailed on registration (or re-sent via POST /api/auth/otp/send).
+ *
+ * Flow:
+ *   1. Look up the live user by email via user-service internal API.
+ *   2. Verify the OTP stored in Redis under `otp:email_verify:<email>`.
+ *   3. PATCH user-service to mark emailVerified = true.
+ *   4. Return 200 — frontend can now redirect to the login/dashboard page.
+ *
+ * Idempotent: calling it again after success is safe (OTP is consumed on first
+ * verification; subsequent calls will return EXPIRED_OR_NOT_FOUND via a 400).
+ */
+router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, res: Response) => {
+  const { email, otp } = req.body as { email: string; otp: string };
+
+  // 1. Resolve the user — we need their userId to delete the OTP key and call user-service
+  const userResp = await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-service-secret': process.env.INTERNAL_SERVICE_SECRET!,
+      },
+      body: JSON.stringify({ email, userType: 'live' }),
+    },
+  );
+
+  if (!userResp.ok) {
+    if (userResp.status === 403) {
+      // 403 indicates INTERNAL_SERVICE_SECRET mismatch
+      throw new AppError('INTERNAL_SERVICE_UNAUTHORIZED', 500, 'Internal service authentication failed');
+    }
+    // Return a generic message for 404 — avoid leaking whether the email exists
+    throw new AppError('INVALID_EMAIL_OR_OTP', 400);
+  }
+
+  const user = await userResp.json() as { userId: string };
+
+  // 2. Verify OTP — keyed by email (matches how createOtp was called in live.service.ts)
+  const result = await verifyOtpCode(email, 'email_verify', otp);
+  if (!result.success) {
+    const codeMap: Record<string, number> = {
+      EXPIRED_OR_NOT_FOUND: 400,
+      MAX_ATTEMPTS_EXCEEDED: 429,
+      INVALID_OTP: 400,
+    };
+    throw new AppError(result.reason ?? 'INVALID_EMAIL_OR_OTP', codeMap[result.reason ?? ''] ?? 400);
+  }
+
+  // 3. Mark email as verified in user-service
+  const patchResp = await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${user.userId}/verify-email`,
+    {
+      method: 'PATCH',
+      headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+    },
+  );
+
+  if (!patchResp.ok) {
+    throw new AppError('EMAIL_VERIFY_PATCH_FAILED', 502);
+  }
+
+  res.json({ success: true, message: 'Email verified successfully. You can now log in.' });
+});
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /api/auth/totp/setup  [auth required]

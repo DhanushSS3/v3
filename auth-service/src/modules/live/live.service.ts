@@ -8,6 +8,17 @@ import { publishEvent } from '../../lib/kafka';
 import { config } from '../../config/env';
 import { LiveRegisterInput, LiveLoginInput } from './live.schema';
 import { AppError } from '../../utils/errors';
+import { logger } from '../../lib/logger';
+
+/**
+ * Fire-and-forget email helper — SMTP failures are logged but never thrown.
+ * The caller's happy path must never depend on email delivery succeeding.
+ */
+function fireEmail(task: Promise<void>, context: Record<string, unknown>): void {
+  task.catch((err: unknown) => {
+    logger.error({ err, ...context }, '[mailer] Email delivery failed — non-fatal');
+  });
+}
 
 // ── Register ──────────────────────────────────────────────────────────────────
 
@@ -34,13 +45,17 @@ export async function registerLiveUser(input: LiveRegisterInput) {
     isSelfTrading: true,
   });
 
-  // Send email verification OTP
+  // Generate + store OTP in Redis (always safe), then attempt email delivery
+  // non-fatally. The user can always re-request via POST /api/auth/otp/send.
   const otp = await createOtp(input.email, 'email_verify');
-  await sendMail({
-    to: input.email,
-    subject: 'Verify your LiveFXHub account',
-    html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
-  });
+  fireEmail(
+    sendMail({
+      to: input.email,
+      subject: 'Verify your LiveFXHub account',
+      html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
+    }),
+    { email: input.email, purpose: 'email_verify' },
+  );
 
   return { accountNumber, message: 'Account created. Please verify your email.' };
 }
@@ -133,13 +148,17 @@ export async function loginLiveUser(
     const loginToken = signLoginPendingToken(ctx.userId, 'live');
 
     if (!hasTOTP) {
-      // Send OTP to email
+      // Generate + store OTP in Redis, then fire email non-fatally.
+      // The loginToken is returned regardless of email delivery outcome.
       const otp = await createOtp(ctx.userId, 'login');
-      await sendMail({
-        to: input.email,
-        subject: 'Your LiveFXHub login code',
-        html: otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
-      });
+      fireEmail(
+        sendMail({
+          to: input.email,
+          subject: 'Your LiveFXHub login code',
+          html: otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
+        }),
+        { userId: ctx.userId, purpose: 'login' },
+      );
     }
 
     // New device — send alert email async (non-blocking)
